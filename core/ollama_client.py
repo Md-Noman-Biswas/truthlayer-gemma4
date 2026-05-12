@@ -1,22 +1,17 @@
 import requests
-import json
-from typing import Optional
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
-DEFAULT_MODEL = "gemma4:e4b"
-FALLBACK_MODEL = "gemma4:e2b"
+DEFAULT_MODEL = "gemma4:e2b"   # E2B as default — stable on 4GB VRAM
+FALLBACK_MODEL = "gemma4:e2b"  # same fallback
 
 
 def query_ollama(
     prompt: str,
     temperature: float = 0.7,
     model: str = DEFAULT_MODEL,
-    max_tokens: int = 512,
-) -> Optional[str]:
-    """
-    Send a single query to Ollama and return the response text.
-    Automatically falls back to E2B if E4B fails.
-    """
+    max_tokens: int = 600,
+) -> str | None:
+    """Send a single query to Ollama, return response text."""
     payload = {
         "model": model,
         "prompt": prompt,
@@ -26,9 +21,8 @@ def query_ollama(
             "num_predict": max_tokens,
         },
     }
-
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=120)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
         response.raise_for_status()
         return response.json().get("response", "").strip()
 
@@ -36,43 +30,88 @@ def query_ollama(
         raise ConnectionError("Ollama is not running. Start it with: ollama serve")
 
     except requests.exceptions.HTTPError as e:
-        # If E4B fails (e.g. OOM), try E2B fallback
-        if model == DEFAULT_MODEL:
-            print(f"[WARNING] E4B failed ({e}), falling back to E2B...")
-            return query_ollama(prompt, temperature, FALLBACK_MODEL, max_tokens)
-        raise
+        print(f"[ERROR] Ollama HTTP error: {e}")
+        return None
+
+
+def build_cot_prompt(query: str) -> str:
+    """
+    Build a short combined prompt — answer + reasoning in one call.
+    """
+    return f"""Please provide a complete and clear answer to this medical query: {query}
+
+After your answer, you MUST append a new section starting exactly with the word "REASONING:" followed by:
+- Based on: (one line)
+- Uncertain about: (one line)
+- User should: (one line)"""
+
+
+def parse_cot_response(raw: str) -> dict:
+    """
+    Split raw response into answer and reasoning parts.
+    Returns dict with 'answer' and 'reasoning' keys.
+    """
+    if "REASONING:" in raw:
+        parts = raw.split("REASONING:", 1)
+        return {
+            "answer": parts[0].strip(),
+            "reasoning": parts[1].strip(),
+        }
+    # If model didn't follow format, treat whole thing as answer
+    return {
+        "answer": raw.strip(),
+        "reasoning": "No reasoning provided.",
+    }
 
 
 def query_multiple(
-    prompt: str,
+    query: str,
     runs: int = 3,
-    temperatures: list[float] = [0.3, 0.7, 1.0],
     model: str = DEFAULT_MODEL,
-) -> list[str]:
+) -> tuple[list[str], list[dict]]:
     """
-    Run the same prompt multiple times with varied temperatures.
-    This is the core of TruthLayer — we need response diversity to detect inconsistency.
-
-    Lower temp (0.3) = more deterministic/confident
-    Higher temp (1.0) = more creative/varied
-
-    If answers vary a lot across temperatures → model is uncertain → low trust
-    If answers are consistent → model is confident → higher trust
+    Run the same query multiple times with varied temperatures.
+    Returns:
+        - raw_responses: list of full raw responses (for trust scoring)
+        - cot_parsed: list of {answer, reasoning} dicts
     """
-    responses = []
-    for i, temp in enumerate(temperatures[:runs]):
+    raw_responses = []
+    cot_parsed = []
+
+    cot_prompt = build_cot_prompt(query)
+
+    # Dynamically generate temperatures between 0.1 and 1.0
+    if runs == 1:
+        temperatures = [0.7]
+    else:
+        temperatures = [round(0.1 + (0.9 * i / (runs - 1)), 2) for i in range(runs)]
+
+    for i, temp in enumerate(temperatures):
         print(f"  [Run {i+1}/{runs}] temperature={temp}")
-        resp = query_ollama(prompt, temperature=temp, model=model)
-        if resp:
-            responses.append(resp)
-    return responses
+        raw = query_ollama(cot_prompt, temperature=temp, model=model)
+        if raw:
+            raw_responses.append(raw)
+            cot_parsed.append(parse_cot_response(raw))
+        else:
+            print(f"  [WARNING] Run {i+1} returned no response, skipping.")
 
+    return raw_responses, cot_parsed
+
+
+def get_installed_models() -> list[str]:
+    """Fetch the list of model names currently installed in Ollama."""
+    try:
+        resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+        return [m["name"] for m in resp.json().get("models", [])]
+    except Exception:
+        return [DEFAULT_MODEL, "gemma4:e4b"]
 
 def check_ollama_available(model: str = DEFAULT_MODEL) -> bool:
     """Check if Ollama is running and the model is available."""
     try:
         resp = requests.get("http://localhost:11434/api/tags", timeout=5)
         models = [m["name"] for m in resp.json().get("models", [])]
-        return any(model.split(":")[0] in m for m in models)
+        # Exact match or base match
+        return any(model == m or model.split(":")[0] == m.split(":")[0] for m in models)
     except Exception:
         return False
