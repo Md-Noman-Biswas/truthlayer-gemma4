@@ -5,10 +5,13 @@ Run with: streamlit run app.py
 
 import streamlit as st
 import time
+import tempfile
+import os
 from itertools import combinations
 from core.ollama_client import query_multiple, check_ollama_available, get_installed_models
 from core.trust_score import compute_trust_score
 from core.reasoning_graph import render_reasoning_graph
+from rag.retriever import document_store
 
 st.set_page_config(
     page_title="TruthLayer",
@@ -65,6 +68,33 @@ with col3:
         st.session_state.runs = 3
     runs = st.number_input("Verification Runs", min_value=1, max_value=10, value=3, key="runs", help="Number of times to query the model. Higher runs increase reliability by comparing multiple responses for consistency.")
 st.divider()
+
+# ── Sidebar UI for RAG ──────────────────────────────────────────
+with st.sidebar:
+    st.header("📚 Document Grounding (RAG)")
+    use_rag = st.checkbox("Enable RAG", value=False, help="Ground the model's answers in your uploaded documents.")
+    
+    st.divider()
+    st.subheader("Upload Documents")
+    uploaded_files = st.file_uploader("Upload Medical PDFs", type=["pdf"], accept_multiple_files=True)
+    
+    if st.button("Process Documents"):
+        if uploaded_files:
+            with st.spinner("Ingesting documents..."):
+                total_chunks = 0
+                for file in uploaded_files:
+                    # Save to temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                        tmp.write(file.getvalue())
+                        tmp_path = tmp.name
+                        
+                    chunks_added = document_store.ingest_pdf(tmp_path, file.name)
+                    total_chunks += chunks_added
+                    os.unlink(tmp_path) # Cleanup
+                    
+                st.success(f"Successfully processed {len(uploaded_files)} files ({total_chunks} chunks stored).")
+        else:
+            st.warning("Please upload a file first.")
 
 # ── State Management ────────────────────────────────────────────
 if "last_query" not in st.session_state:
@@ -155,9 +185,15 @@ if st.session_state.last_query and not st.session_state.analysis_result:
     st.info(st.session_state.last_query)
     
     with st.status("Analyzing query...", expanded=True) as status:
+        context = None
+        if use_rag:
+            st.write("🔍 Retrieving relevant context from ChromaDB...")
+            context = document_store.search(st.session_state.last_query, top_k=3)
+            st.session_state.retrieved_context = context
+
         st.write(f"🔄 Executing {runs} verification passes using Gemma 4...")
         t0 = time.time()
-        raw_responses, parsed = query_multiple(st.session_state.last_query, runs=runs, model=model)
+        raw_responses, parsed = query_multiple(st.session_state.last_query, runs=runs, model=model, context=context)
         elapsed_time = time.time() - t0
 
         if not raw_responses:
@@ -210,6 +246,12 @@ if st.session_state.analysis_result:
     st.caption(result["advice"])
     
     st.divider()
+
+    # ── Retrieved Context (If RAG enabled) ──────────────────────
+    if st.session_state.get("retrieved_context"):
+        with st.expander("📚 Retrieved Context", expanded=True):
+            for ctx in st.session_state.retrieved_context:
+                st.markdown(f"```text\n{ctx}\n```")
 
     # ── Reasoning Graph (Visible by default) ───────────────────────────────────
     st.markdown("### 🧠 Model Reasoning Graph")

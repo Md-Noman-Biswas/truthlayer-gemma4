@@ -34,16 +34,25 @@ def query_ollama(
         return None
 
 
-def build_cot_prompt(query: str) -> str:
+def build_cot_prompt(query: str, context: list[str] = None) -> str:
     """
     Build a short combined prompt — answer + reasoning in one call.
     """
-    return f"""Please provide a complete and clear answer to this medical query: {query}
+    base_prompt = ""
+    
+    if context and len(context) > 0:
+        context_str = "\n\n".join(context)
+        base_prompt += f"--- CONTEXT INFORMATION ---\n{context_str}\n---------------------------\n\n"
+        base_prompt += f"Please provide a complete and clear answer to this medical query based ONLY on the context information above. Explicitly cite the source if applicable. If the context does not contain the answer, say so.\n\nQuery: {query}\n\n"
+    else:
+        base_prompt += f"Please provide a complete and clear answer to this medical query: {query}\n\n"
 
-After your answer, you MUST append a new section starting exactly with the word "REASONING:" followed by:
+    base_prompt += """After your answer, you MUST append a new section starting exactly with the word "REASONING:" followed by:
 - Based on: (one line)
 - Uncertain about: (one line)
 - User should: (one line)"""
+    
+    return base_prompt
 
 
 def parse_cot_response(raw: str) -> dict:
@@ -68,6 +77,7 @@ def query_multiple(
     query: str,
     runs: int = 3,
     model: str = DEFAULT_MODEL,
+    context: list[str] = None
 ) -> tuple[list[str], list[dict]]:
     """
     Run the same query multiple times with varied temperatures.
@@ -78,7 +88,7 @@ def query_multiple(
     raw_responses = []
     cot_parsed = []
 
-    cot_prompt = build_cot_prompt(query)
+    cot_prompt = build_cot_prompt(query, context=context)
 
     # Dynamically generate temperatures between 0.1 and 1.0
     if runs == 1:
